@@ -43,7 +43,8 @@ class VoiceTools(str, Enum):
 
 # Global state and resources (initialized lazily)
 pyaudio_instance = None
-tts_pipeline = None
+tts_pipeline = None  # Legacy, kept for backward compatibility
+pipelines = {}  # Map of language codes to KPipeline instances
 whisper_model = None
 process_pool = None
 thread_pool = None
@@ -204,12 +205,24 @@ def record_audio(max_duration=30, silence_threshold=0.01, silence_duration=2.0):
     
     logger.info("Record audio thread finished")
 
+def get_pipeline_for(language: str) -> 'KPipeline':
+    """Return or create a KPipeline for the requested language."""
+    # Map ISO-like codes to Kokoro single letters
+    lang_map = {"en": "a", "en-gb": "b", "es": "e"}
+    code = lang_map.get(language, "a")  # default to American English
+    if code not in pipelines:
+        # Import KPipeline here to avoid circular import
+        from kokoro import KPipeline
+        logger.info(f"[TTS] Creating pipeline for lang_code='{code}'")
+        pipelines[code] = KPipeline(lang_code=code)
+    return pipelines[code]
+
 def ensure_initialized():
     """
     Lazily initialize the voice server resources on first use.
     Returns True if initialization is successful.
     """
-    global pyaudio_instance, tts_pipeline, whisper_model, process_pool, thread_pool, initialization_complete, initialization_error
+    global pyaudio_instance, whisper_model, process_pool, thread_pool, initialization_complete, initialization_error
     
     if initialization_complete:
         return True
@@ -228,7 +241,6 @@ def ensure_initialized():
         
         # Only import model-related libraries when needed
         from faster_whisper import WhisperModel
-        from kokoro import KPipeline
         
         # Check device availability
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -247,9 +259,8 @@ def ensure_initialized():
         for _ in segments:
             pass
         
-        # Initialize KOKORO TTS
-        logger.info("Initializing KOKORO TTS pipeline...")
-        tts_pipeline = KPipeline(lang_code='a')
+        # Initialize KPipelines - we'll create them on-demand
+        logger.info("Initializing KOKORO TTS pipeline system...")
         
         # Initialize ProcessPoolExecutor
         logger.info("Initializing process pool...")
@@ -339,13 +350,14 @@ def transcribe_sync(audio_data, model):
 class VoiceAssistantServer:
     """Core server logic for the Voice Assistant."""
     
-    async def speak(self, text: str, voice: str = "af_bella") -> str:
+    async def speak(self, text: str, voice: str = "af_bella", language: str = "en") -> str:
         """
         Convert text to speech using the Kokoro TTS engine.
         
         Args:
             text: The text to speak
-            voice: The voice to use
+            voice: The voice to use (if not specified, a voice appropriate for the language will be chosen)
+            language: The language code ('en' for English, 'es' for Spanish, etc.)
             
         Returns:
             A confirmation message
@@ -353,45 +365,62 @@ class VoiceAssistantServer:
         if not ensure_initialized():
             return "Error: Voice server initialization failed."
         
-        logger.info(f"Speaking with voice {voice}: {text[:100]}...")
+        # 1️⃣ Choose a default voice for the language
+        if voice == "af_bella":  # caller didn't override
+            voice = {
+                "en": "af_bella",
+                "en-gb": "bf_emma",
+                "es": "em_alex"
+            }.get(language, "af_bella")
         
-        # Prepare TTS generator
-        generator = tts_pipeline(text, voice)
+        # 2️⃣ Validate Spanish voices
+        if language == "es" and voice not in {"ef_dora", "em_alex", "em_santa"}:
+            logger.warning(f"[TTS] Unknown Spanish voice '{voice}', falling back to em_alex")
+            voice = "em_alex"
         
-        # Determine output sample rate and ensure stream is ready
-        base_rate = 24000
-        stream = ensure_tts_stream(base_rate)
-        if not stream:
-            return f"Error: Could not open audio output stream."
-
-        # Stream audio chunks
-        total_chars = len(text)
+        # 3️⃣ Grab language-specific pipeline
         try:
-            for i, (gold, prompt_state, audio) in enumerate(generator):
-                if audio is None or not stream:
-                    continue
-                # Ensure float32 array
-                if hasattr(audio, 'numpy'):  # PyTorch tensor
-                    chunk = audio.numpy().astype(np.float32)
-                elif isinstance(audio, np.ndarray):  # Already numpy array
-                    chunk = audio.astype(np.float32)
-                else:
-                    chunk = np.array(audio, dtype=np.float32)  # Convert other types
+            pipeline = get_pipeline_for(language)
+            logger.info(f"[TTS] lang='{language}' → code='{pipeline.lang_code}', voice='{voice}', text='{text[:60]}...'")
+            
+            # Generate and stream audio
+            stream = ensure_tts_stream(24000)
+            if not stream:
+                return f"Error: Could not open audio output stream."
+            
+            try:
+                # Stream audio chunks
+                total_chars = len(text)
+                for i, (gold, prompt_state, audio) in enumerate(pipeline(text, voice)):
+                    if audio is None or not stream:
+                        continue
+                    
+                    # Ensure float32 array
+                    if hasattr(audio, 'numpy'):  # PyTorch tensor
+                        chunk = audio.numpy().astype(np.float32)
+                    elif isinstance(audio, np.ndarray):  # Already numpy array
+                        chunk = audio.astype(np.float32)
+                    else:
+                        chunk = np.array(audio, dtype=np.float32)  # Convert other types
+                    
+                    if stream.is_active():
+                        stream.write(chunk.tobytes())
+                        # Log periodically to show progress
+                        if i % 25 == 0 and i > 0:
+                            logger.debug(f"[TTS] Streamed {i} chunks")
+                    else:
+                        logger.error("[TTS] Output stream is not active. Stopping playback.")
+                        break
                 
-                if stream.is_active():
-                    stream.write(chunk.tobytes())
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f"Streamed chunk {i+1}")
-                else:
-                    logger.error("TTS output stream is not active. Stopping playback.")
-                    break
+                confirmation = f"Spoke {total_chars} chars ({language}) with {voice}"
+                logger.info(confirmation)
+                return confirmation
+            except Exception as e:
+                logger.error(f"Error during streaming playback: {e}", exc_info=True)
+                return f"Error during playback: {e}"
         except Exception as e:
-            logger.error(f"Error during streaming playback: {e}", exc_info=True)
-            return f"Error during playback: {e}"
-
-        confirmation = f"Spoke {total_chars} characters with voice {voice}."
-        logger.info(confirmation)
-        return confirmation
+            logger.exception("[TTS] Failure")
+            return f"Error generating speech: {e}"
     
     async def listen(self, max_duration: int = 30, silence_duration: float = 2.0, silence_threshold: float = 0.01) -> str:
         """
@@ -493,19 +522,20 @@ class VoiceAssistantServer:
             logger.error(f"Error transcribing audio: {e}", exc_info=True)
             return f"Error: Failed to transcribe audio. {type(e).__name__}"
     
-    async def conversation_turn(self, system_message: str, max_listen_duration: int = 30) -> str:
+    async def conversation_turn(self, system_message: str, max_listen_duration: int = 30, language: str = "en") -> str:
         """
         Perform a complete conversation turn: speak a message and listen for a response.
         
         Args:
             system_message: The message to speak to the user
             max_listen_duration: Maximum duration to listen for a response
+            language: The language code ('en' for English, 'es' for Spanish, etc.)
             
         Returns:
             The user's response as transcribed text, or an error message
         """
-        # Speak the system message
-        speak_result = await self.speak(system_message)
+        # Speak the system message in the specified language
+        speak_result = await self.speak(system_message, language=language)
         logger.info(f"Spoke system message: {speak_result}")
         
         # Listen for the user's response
@@ -540,8 +570,14 @@ async def serve() -> None:
                         },
                         "voice": {
                             "type": "string",
-                            "description": "The voice to use for speech (default: af_bella)",
+                            "description": "The voice to use for speech. For Spanish, use one of 'ef_dora', 'em_alex', or 'em_santa'.",
                             "default": "af_bella"
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "The language code: 'en' (English), 'es' (Spanish). Spanish voices are 'ef_dora', 'em_alex', and 'em_santa'.",
+                            "default": "en",
+                            "enum": ["en", "es", "en-gb"]
                         }
                     },
                     "required": ["text"]
@@ -585,6 +621,12 @@ async def serve() -> None:
                             "type": "integer",
                             "description": "Maximum duration to listen for a response (seconds)",
                             "default": 30
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "The language code: 'en' (English), 'es' (Spanish). Spanish voices are 'ef_dora', 'em_alex', and 'em_santa'.",
+                            "default": "en",
+                            "enum": ["en", "es", "en-gb"]
                         }
                     },
                     "required": ["system_message"]
@@ -600,11 +642,12 @@ async def serve() -> None:
                 case VoiceTools.SPEAK.value:
                     text = arguments.get("text")
                     voice = arguments.get("voice", "af_bella")
+                    language = arguments.get("language", "en")
                     
                     if not text:
                         raise ValueError("Missing required parameter: text")
                     
-                    result = await voice_server.speak(text, voice)
+                    result = await voice_server.speak(text, voice, language)
                     return [TextContent(type="text", text=result)]
                 
                 case VoiceTools.LISTEN.value:
@@ -618,11 +661,12 @@ async def serve() -> None:
                 case VoiceTools.CONVERSATION_TURN.value:
                     system_message = arguments.get("system_message")
                     max_listen_duration = arguments.get("max_listen_duration", 30)
+                    language = arguments.get("language", "en")
                     
                     if not system_message:
                         raise ValueError("Missing required parameter: system_message")
                     
-                    result = await voice_server.conversation_turn(system_message, max_listen_duration)
+                    result = await voice_server.conversation_turn(system_message, max_listen_duration, language)
                     return [TextContent(type="text", text=result)]
                 
                 case _:
