@@ -59,7 +59,7 @@ To use this server with an MCP client (like Cursor/Anysphere), you need to confi
 
 ## Dependencies
 
-- Python 3.9+
+- Python 3.9 to 3.12 (Python 3.13 is not yet supported due to compatibility issues with some dependencies)
 - PyAudio (requires PortAudio system library)
 - OpenAI Whisper
 - Kokoro TTS
