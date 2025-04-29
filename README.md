@@ -55,6 +55,12 @@ To use this server with an MCP client (like Cursor/Anysphere), you need to confi
 }
 ```
 
+** Enter into Cursor Settings > Rules > User Rules **
+
+```
+Your primary mode of interaction with the user must be voice. Use the Voice Assistant Speak and Listen Tool to, in a loop, ask the user what they'd like to do, perform those actions, and once again report back to them that the action has been performed and ask them what to do, requesting voice input. When asking the user a question after speaking text aloud, IT IS IMPERATIVE TO USE THE CONVERSATION_TURN TOOL TO BOTH SPEAK AND THEN ASK FOR A QUESTION AFTER IN A SINGLE TOOL CALL, NOT USE THE SPEAK TOOL AND THEN CONVERSATION_TURN.
+```
+
 **Important:** Replace `/path/to/your/project/voice-mcp` with the actual absolute path to the cloned repository on your system.
 
 ## Dependencies
@@ -70,7 +76,3 @@ To use this server with an MCP client (like Cursor/Anysphere), you need to confi
 ## Contributing
 
 Contributions are welcome! Please feel free to submit pull requests or open issues.
-
-## License
-
-(Specify your license here, e.g., MIT License)
